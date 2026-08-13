@@ -296,6 +296,7 @@ BEGIN_MESSAGE_MAP(CMainFrame, CFrameWnd)
     ON_MESSAGE(WM_MPC_SHUTDOWN, OnDoShutdown)
     ON_MESSAGE(WM_MPC_LOGOFF, OnDoLogOff)
     ON_MESSAGE(WM_MPC_OPENCURPLAYLIST, OnDoOpenCurPlaylist)
+    ON_MESSAGE(WM_SENDAPICURRENTHOST, OnSendApiCurrentHost)
 
     ON_MESSAGE(WM_SMTC_SEEK, OnSmtcSeek)
     ON_MESSAGE(WM_SMTC_AUTOREPEAT, OnSmtcAutoRepeat)
@@ -4016,16 +4017,18 @@ void CMainFrame::OnMenuFilters()
 
 void CMainFrame::OnUpdatePlayerStatus(CCmdUI* pCmdUI)
 {
-    if (GetLoadState() == MLS::LOADING) {
+    const MLS loadState = GetLoadState();
+    if (loadState != MLS::CLOSING && !m_tempstatus_msg.IsEmpty()) {
+        m_wndStatusBar.SetStatusMessage(m_tempstatus_msg);
+        return;
+    }
+
+    if (loadState == MLS::LOADING) {
         m_wndStatusBar.SetStatusMessage(StrRes(IDS_CONTROLS_OPENING));
         if (AfxGetAppSettings().bUseEnhancedTaskBar && m_pTaskbarList) {
             m_pTaskbarList->SetProgressState(m_hWnd, TBPF_NOPROGRESS);
         }
-    } else if (GetLoadState() == MLS::LOADED) {
-        if (!m_tempstatus_msg.IsEmpty()) {
-            m_wndStatusBar.SetStatusMessage(m_tempstatus_msg);
-            return;
-        }
+    } else if (loadState == MLS::LOADED) {
         CString msg;
         if (m_fCapturing) {
             msg.LoadString(IDS_CONTROLS_CAPTURING);
@@ -4216,7 +4219,7 @@ void CMainFrame::OnUpdatePlayerStatus(CCmdUI* pCmdUI)
         }
 
         m_wndStatusBar.SetStatusMessage(msg);
-    } else if (GetLoadState() == MLS::CLOSING) {
+    } else if (loadState == MLS::CLOSING) {
         m_wndStatusBar.SetStatusMessage(StrRes(IDS_CONTROLS_CLOSING));
         if (AfxGetAppSettings().bUseEnhancedTaskBar && m_pTaskbarList) {
             m_pTaskbarList->SetProgressState(m_hWnd, TBPF_NOPROGRESS);
@@ -5092,9 +5095,32 @@ BOOL CMainFrame::OnCopyData(CWnd* pWnd, COPYDATASTRUCT* pCDS)
         PLAYER_LOG(_T("CMainFrame::OnCopyData"));
     }
 
+    if (pCDS->dwData == CMD_GETHOST) {
+        const HWND hReply = pWnd ? pWnd->GetSafeHwnd() : nullptr;
+        DWORD requesterPid = 0;
+        if (!hReply || !IsWindow(hReply) || !GetWindowThreadProcessId(hReply, &requesterPid)) {
+            return FALSE;
+        }
+
+        const auto duplicate = std::find_if(m_pendingApiHostReplies.cbegin(), m_pendingApiHostReplies.cend(),
+                                            [hReply, requesterPid](const PendingApiHostReply& reply) {
+                                                return reply.window == hReply && reply.processId == requesterPid;
+                                            });
+        if (duplicate == m_pendingApiHostReplies.cend()) {
+            if (m_pendingApiHostReplies.size() >= 32) {
+                return FALSE;
+            }
+            m_pendingApiHostReplies.push_back({ hReply, requesterPid });
+            if (m_pendingApiHostReplies.size() == 1) {
+                PostMessage(WM_SENDAPICURRENTHOST);
+            }
+        }
+        return TRUE;
+    }
+
     if (pCDS->dwData != 0x6ABE51 || pCDS->cbData < sizeof(DWORD)) {
         if (s.hMasterWnd) {
-            ProcessAPICommand(pCDS);
+            ProcessAPICommand(pWnd ? pWnd->GetSafeHwnd() : nullptr, pCDS);
             return TRUE;
         } else {
             return FALSE;
@@ -5121,6 +5147,9 @@ BOOL CMainFrame::OnCopyData(CWnd* pWnd, COPYDATASTRUCT* pCDS)
     s.ParseCommandLine(cmdln);
 
     if (s.nCLSwitches & CLSW_SLAVE) {
+        m_lastApiVolume = GetVolume();
+        m_lastApiMute = IsMuted() ? 1 : 0;
+        GetWindowThreadProcessId(s.hMasterWnd, &m_apiHostPid);
         SendAPICommand(CMD_CONNECT, L"%d", PtrToInt(GetSafeHwnd()));
         s.nCLSwitches &= ~CLSW_SLAVE;
     }
@@ -10689,21 +10718,32 @@ void CMainFrame::OnPlayFiltersStreams(UINT nID)
 
 void CMainFrame::OnPlayVolume(UINT nID)
 {
+    const int volume = GetVolume();
+    const int mute = IsMuted() ? 1 : 0;
+    if (volume == m_lastProcessedVolume && mute == m_lastProcessedMute) {
+        return;
+    }
+    m_lastProcessedVolume = volume;
+    m_lastProcessedMute = mute;
+
     if (GetLoadState() == MLS::LOADED) {
         CString strVolume;
         m_pBA->put_Volume(m_wndToolBar.Volume);
 
         //strVolume.Format (L"Vol : %d dB", m_wndToolBar.Volume / 100);
-        if (m_wndToolBar.Volume == -10000) {
+        if (mute) {
             strVolume.Format(IDS_VOLUME_OSD, 0);
         } else {
-            strVolume.Format(IDS_VOLUME_OSD, m_wndToolBar.m_volctrl.GetPos());
+            strVolume.Format(IDS_VOLUME_OSD, volume);
         }
         m_OSD.DisplayMessage(OSD_TOPLEFT, strVolume);
         //SendStatusMessage(strVolume, 3000); // Now the volume is displayed in three places at once.
     }
 
-    m_Lcd.SetVolume((m_wndToolBar.Volume > -10000 ? m_wndToolBar.m_volctrl.GetPos() : 1));
+    m_Lcd.SetVolume(mute ? 1 : volume);
+
+    SendCurrentVolumeToApi();
+    SendCurrentMuteToApi();
 }
 
 void CMainFrame::OnPlayVolumeBoost(UINT nID)
@@ -19780,7 +19820,7 @@ void CMainFrame::StopWebServer()
     }
 }
 
-void CMainFrame::SendStatusMessage(CString msg, int nTimeOut, bool bError /* = false */)
+void CMainFrame::SendStatusMessage(CString msg, int nTimeOut, bool bRevealStatusBar /* = false */)
 {
     const auto timerId = TimerOneTimeSubscriber::STATUS_ERASE;
 
@@ -19792,19 +19832,19 @@ void CMainFrame::SendStatusMessage(CString msg, int nTimeOut, bool bError /* = f
     }
 
     m_tempstatus_msg = msg;
-    // For a transient error we briefly reveal a preset-hidden status bar; re-hide it when the
-    // message times out so a recurring error (e.g. a failing shader on each load) can't pin it open (#3256).
-    m_timerOneTime.Subscribe(timerId, [this, bError] {
+    // A caller may briefly reveal a preset-hidden status bar; re-hide it when the
+    // message times out so recurring messages cannot pin it open (#3256).
+    m_timerOneTime.Subscribe(timerId, [this, bRevealStatusBar] {
         m_tempstatus_msg.Empty();
-        if (bError) {
+        if (bRevealStatusBar) {
             RestoreStatusBarMessageHold();
         }
     }, nTimeOut);
 
     if (!m_tempstatus_msg.IsEmpty()) {
         m_wndStatusBar.SetStatusMessage(m_tempstatus_msg);
-        if (bError) {
-            ShowStatusBarForMessage(); // reveal the status bar (if a preset hides it) for errors only
+        if (bRevealStatusBar) {
+            ShowStatusBarForMessage();
         }
     }
 
@@ -21283,7 +21323,55 @@ void CMainFrame::ResetSubtitlePosAndSize(bool repaint /* = false*/)
 }
 
 
-void CMainFrame::ProcessAPICommand(COPYDATASTRUCT* pCDS)
+static bool ParseAPIInteger(const COPYDATASTRUCT* pCDS, int minimum, int maximum, int& result)
+{
+    if (!pCDS || !pCDS->lpData || pCDS->cbData < sizeof(wchar_t)
+            || pCDS->cbData % sizeof(wchar_t) != 0) {
+        return false;
+    }
+
+    const wchar_t* const value = static_cast<const wchar_t*>(pCDS->lpData);
+    const size_t length = pCDS->cbData / sizeof(wchar_t);
+    if (length > 4 || value[length - 1] != L'\0'
+            || wmemchr(value, L'\0', length - 1)
+            || value[0] < L'0' || value[0] > L'9') {
+        return false;
+    }
+
+    wchar_t* end = nullptr;
+    const long parsed = wcstol(value, &end, 10);
+    if (end == value || *end != L'\0' || parsed < minimum || parsed > maximum) {
+        return false;
+    }
+
+    result = static_cast<int>(parsed);
+    return true;
+}
+
+static bool ParseAPIStatusMessage(const COPYDATASTRUCT* pCDS, CStringW& message)
+{
+    constexpr size_t maxCharacters = 512;
+    if (!pCDS || !pCDS->lpData || pCDS->cbData < 2 * sizeof(wchar_t)
+            || pCDS->cbData > (maxCharacters + 1) * sizeof(wchar_t)
+            || pCDS->cbData % sizeof(wchar_t) != 0) {
+        return false;
+    }
+
+    const wchar_t* const value = static_cast<const wchar_t*>(pCDS->lpData);
+    const size_t length = pCDS->cbData / sizeof(wchar_t);
+    if (value[length - 1] != L'\0' || wmemchr(value, L'\0', length - 1)) {
+        return false;
+    }
+
+    message.SetString(value, static_cast<int>(length - 1));
+    message.Replace(L'\r', L' ');
+    message.Replace(L'\n', L' ');
+    message.Replace(L'\t', L' ');
+    message.Trim();
+    return !message.IsEmpty();
+}
+
+void CMainFrame::ProcessAPICommand(HWND hSender, COPYDATASTRUCT* pCDS)
 {
     CAtlList<CString> fns;
     REFERENCE_TIME rtPos = 0;
@@ -21368,6 +21456,24 @@ void CMainFrame::ProcessAPICommand(COPYDATASTRUCT* pCDS)
                 m_OSD.DisplayMessage(OSD_TOPLEFT, m_wndStatusBar.GetStatusTimer(), 2000);
             }
             break;
+        case CMD_SETVOLUME: {
+            int volume;
+            if (hSender == AfxGetAppSettings().hMasterWnd
+                    && ParseAPIInteger(pCDS, 0, 100, volume) && volume != GetVolume()) {
+                // SetVolume posts the canonical volume-change notification.
+                m_wndToolBar.SetVolume(volume);
+            }
+            break;
+        }
+        case CMD_SETMUTE: {
+            int mute;
+            if (hSender == AfxGetAppSettings().hMasterWnd
+                    && ParseAPIInteger(pCDS, 0, 1, mute) && (mute != 0) != IsMuted()) {
+                m_wndToolBar.SetMute(mute != 0);
+                OnPlayVolume(ID_VOLUME_MUTE);
+            }
+            break;
+        }
         case CMD_SETAUDIODELAY:
             rtPos = (REFERENCE_TIME)_wtol((LPCWSTR)pCDS->lpData) * 10000;
             SetAudioDelay(rtPos);
@@ -21403,6 +21509,12 @@ void CMainFrame::ProcessAPICommand(COPYDATASTRUCT* pCDS)
             break;
         case CMD_GETCURRENTPOSITION:
             SendCurrentPositionToApi();
+            break;
+        case CMD_GETVOLUME:
+            SendCurrentVolumeToApi(true);
+            break;
+        case CMD_GETMUTE:
+            SendCurrentMuteToApi(true);
             break;
         case CMD_GETNOWPLAYING:
             SendNowPlayingToApi();
@@ -21444,7 +21556,61 @@ void CMainFrame::ProcessAPICommand(COPYDATASTRUCT* pCDS)
         case CMD_OSDSHOWMESSAGE:
             ShowOSDCustomMessageApi((MPC_OSDDATA*)pCDS->lpData);
             break;
+        case CMD_STATUSSHOWMESSAGE: {
+            CStringW message;
+            const CAppSettings& settings = AfxGetAppSettings();
+            if (hSender == settings.hMasterWnd && IsWindow(hSender)
+                    && ParseAPIStatusMessage(pCDS, message)) {
+                SendStatusMessage(message, 3000, true);
+            }
+            break;
+        }
     }
+}
+
+LRESULT CMainFrame::OnSendApiCurrentHost(WPARAM wParam, LPARAM lParam)
+{
+    if (m_pendingApiHostReplies.empty()) {
+        return 0;
+    }
+
+    const PendingApiHostReply reply = m_pendingApiHostReplies.front();
+    m_pendingApiHostReplies.pop_front();
+
+    DWORD currentReplyPid = 0;
+    if (IsWindow(reply.window)
+            && GetWindowThreadProcessId(reply.window, &currentReplyPid)
+            && currentReplyPid == reply.processId) {
+        HWND hHost = AfxGetAppSettings().hMasterWnd;
+        DWORD currentHostPid = 0;
+        if (!hHost || !IsWindow(hHost)
+                || !GetWindowThreadProcessId(hHost, &currentHostPid)
+                || (m_apiHostPid && currentHostPid != m_apiHostPid)) {
+            hHost = nullptr;
+        }
+
+        CStringW payload;
+        payload.Format(L"%Iu", reinterpret_cast<UINT_PTR>(hHost));
+        SendAPIStringTo(reply.window, CMD_CURRENTHOST, payload);
+    }
+
+    if (!m_pendingApiHostReplies.empty()) {
+        PostMessage(WM_SENDAPICURRENTHOST);
+    }
+    return 0;
+}
+
+void CMainFrame::SendAPIStringTo(HWND hTarget, MPCAPI_COMMAND nCommand, const CStringW& payload)
+{
+    COPYDATASTRUCT data = {};
+    data.cbData = static_cast<DWORD>((payload.GetLength() + 1) * sizeof(wchar_t));
+    data.dwData = nCommand;
+    data.lpData = const_cast<wchar_t*>(payload.GetString());
+
+    DWORD_PTR result = 0;
+    SendMessageTimeout(hTarget, WM_COPYDATA, reinterpret_cast<WPARAM>(GetSafeHwnd()),
+                       reinterpret_cast<LPARAM>(&data),
+                       SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT, 100, &result);
 }
 
 void CMainFrame::SendAPICommand(MPCAPI_COMMAND nCommand, LPCWSTR fmt, ...)
@@ -21825,6 +21991,36 @@ void CMainFrame::SendCurrentPositionToApi(bool fNotifySeek)
         }
 
         SendAPICommand(fNotifySeek ? CMD_NOTIFYSEEK : CMD_CURRENTPOSITION, strPos);
+    }
+}
+
+void CMainFrame::SendCurrentVolumeToApi(bool force)
+{
+    if (!AfxGetAppSettings().hMasterWnd) {
+        return;
+    }
+
+    const int volume = GetVolume();
+    if (force || volume != m_lastApiVolume) {
+        CStringW payload;
+        payload.Format(L"%d", volume);
+        SendAPIStringTo(AfxGetAppSettings().hMasterWnd, CMD_CURRENTVOLUME, payload);
+        m_lastApiVolume = volume;
+    }
+}
+
+void CMainFrame::SendCurrentMuteToApi(bool force)
+{
+    if (!AfxGetAppSettings().hMasterWnd) {
+        return;
+    }
+
+    const int mute = IsMuted() ? 1 : 0;
+    if (force || mute != m_lastApiMute) {
+        CStringW payload;
+        payload.Format(L"%d", mute);
+        SendAPIStringTo(AfxGetAppSettings().hMasterWnd, CMD_CURRENTMUTE, payload);
+        m_lastApiMute = mute;
     }
 }
 
