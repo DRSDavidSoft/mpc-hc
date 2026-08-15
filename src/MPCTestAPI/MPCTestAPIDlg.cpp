@@ -190,6 +190,9 @@ BOOL CRegisterCopyDataDlg::OnInitDialog()
     m_strMPCPath += _T("mpc-hc.exe");
 #endif // _WIN64
 
+    // The other combo entries live in the .rc DLGINIT block; appending this one in
+    // code keeps its index (23) in sync with OnBnClickedButtonSendcommand without
+    // hand-editing DLGINIT. Note: regenerating the .rc in a resource editor drops it.
     if (CComboBox* pCommand = static_cast<CComboBox*>(GetDlgItem(IDC_COMBO1))) {
         pCommand->AddString(_T("Get host"));
     }
@@ -262,14 +265,19 @@ void CRegisterCopyDataDlg::OnButtonFindwindow()
 
 void CRegisterCopyDataDlg::Senddata(MPCAPI_COMMAND nCmd, LPCTSTR strCommand)
 {
-    if (m_hWndMPC) {
+    SenddataTo(m_hWndMPC, nCmd, strCommand);
+}
+
+void CRegisterCopyDataDlg::SenddataTo(HWND hWndTarget, MPCAPI_COMMAND nCmd, LPCTSTR strCommand)
+{
+    if (hWndTarget) {
         COPYDATASTRUCT MyCDS;
 
         MyCDS.dwData = nCmd;
         MyCDS.cbData = (DWORD)(_tcslen(strCommand) + 1) * sizeof(TCHAR);
         MyCDS.lpData = (LPVOID) strCommand;
 
-        ::SendMessage(m_hWndMPC, WM_COPYDATA, (WPARAM)GetSafeHwnd(), (LPARAM)&MyCDS);
+        ::SendMessage(hWndTarget, WM_COPYDATA, (WPARAM)GetSafeHwnd(), (LPARAM)&MyCDS);
     }
 }
 
@@ -362,7 +370,13 @@ void CRegisterCopyDataDlg::OnBnClickedButtonSendcommand()
             Senddata(CMD_CLOSEAPP, m_txtCommand);
             break;
         case 23:
-            Senddata(CMD_GETHOST, strEmpty);
+            // Unlike the other commands, host discovery is meaningful even for an
+            // MPC-HC instance we did not launch. If we have no connection, find a
+            // running player by its window class for this query only; the reply's
+            // wParam identifies the responding instance, so there is no need to
+            // remember the window (and misdirect every later command to it).
+            SenddataTo(m_hWndMPC ? m_hWndMPC : ::FindWindow(MPC_WND_CLASS_NAME, nullptr),
+                       CMD_GETHOST, strEmpty);
             break;
     }
 }
